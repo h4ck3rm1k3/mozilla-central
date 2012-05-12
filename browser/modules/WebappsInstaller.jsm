@@ -825,7 +825,7 @@ function writeToFile(aFile, aData, aCallback) {
                     .createInstance(Ci.nsIScriptableUnicodeConverter);
   converter.charset = "UTF-8";
   let istream = converter.convertToInputStream(aData);
-  NetUtil.asyncCopy(istream, ostream, function(x) aCallback(x));
+  NetUtil.asyncCopy(istream, ostream, function(x) { aCallback(x); } );
 }
 
 /**
