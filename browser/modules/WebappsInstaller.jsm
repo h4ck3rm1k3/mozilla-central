@@ -32,6 +32,8 @@ let WebappsInstaller = {
     let shell = new WinNativeApp(aData);
 #elifdef XP_MACOSX
     let shell = new MacNativeApp(aData);
+#elifdef XP_UNIX
+    let shell = new LinuxNativeApp(aData);
 #else
     return false;
 #endif
@@ -48,8 +50,8 @@ let WebappsInstaller = {
 }
 
 /**
- * This function implements the common constructor for both
- * the Windows and Mac native app shells. It reads and parses
+ * This function implements the common constructor for
+ * the Windows, Mac and Linux native app shells. It reads and parses
  * the data from the app manifest and stores it in the NativeApp
  * object. It's meant to be called as NativeApp.call(this, aData)
  * from the platform-specific constructor.
@@ -651,6 +653,159 @@ MacNativeApp.prototype = {
     }
   }
 
+}
+
+#elifdef XP_UNIX
+
+function LinuxNativeApp(aData) {
+  NativeApp.call(this, aData);
+  this._init();
+}
+
+LinuxNativeApp.prototype = {
+  _init: function() {
+    let filenameRE = new RegExp("[<>:\"/\\\\|\\?\\*]", "gi");
+
+    this.appNameAsFilename = this.appNameAsFilename.replace(filenameRE, "");
+    this.appNameAsFilename = this.appNameAsFilename.toLowerCase();
+
+    // Need a unique name here, maybe like installDir on Windows
+    this.installDir = Services.dirsvc.get("Home", Ci.nsILocalFile);
+    this.installDir.append("." + this.appNameAsFilename);
+
+    this.iconFile = this.installDir.clone();
+    this.iconFile.append(this.appNameAsFilename + ".png");
+
+    this.processFolder = Services.dirsvc.get("CurProcD", Ci.nsIFile);
+  },
+
+  install: function() {
+    this._removeInstallation();
+    try {
+      this._createDirectoryStructure();
+      this._copyPrebuiltFiles();
+      this._createConfigFiles();
+    } catch (ex) {
+      this._removeInstallation();
+      throw(ex);
+    }
+
+    getIconForApp(this);
+  },
+
+  _removeInstallation: function() {
+    try {
+      if (this.installDir.exists()) {
+        this.installDir.followLinks = false;
+        this.installDir.remove(true);
+      }
+    } catch(ex) {
+    }
+  },
+
+  _createDirectoryStructure: function() {
+    this.installDir.create(Ci.nsIFile.DIRECTORY_TYPE, 0777);
+  },
+
+  _copyPrebuiltFiles: function() {
+    let webapprt = this.processFolder.clone();
+    webapprt.append("webapprt-stub");
+    webapprt.copyTo(this.installDir, "webapprt-stub");
+  },
+
+  _createConfigFiles: function() {
+    // ${InstallDir}/webapp.json
+    let json = {
+      "registryDir": this.profileFolder.path,
+      "app": this.app
+    };
+
+    let configJson = this.installDir.clone();
+    configJson.append("webapp.json");
+    writeToFile(configJson, JSON.stringify(json), function() {});
+
+    // ${InstallDir}/webapp.ini
+    let webappINI = this.installDir.clone().QueryInterface(Ci.nsILocalFile);
+    webappINI.append("webapp.ini");
+
+    let factory = Cc["@mozilla.org/xpcom/ini-processor-factory;1"]
+                    .getService(Ci.nsIINIParserFactory);
+
+    let writer = factory.createINIParser(webappINI).QueryInterface(Ci.nsIINIParserWriter);
+    writer.setString("Webapp", "Name", this.appName);
+    writer.setString("Webapp", "Profile", this.appNameAsFilename);
+    writer.setString("WebappRT", "InstallDir", this.processFolder.path);
+    writer.writeFile();
+
+    //NEEDS BUG 744190
+    //let desktopINI = Services.dirsvc.get("XDGDataHome", Ci.nsIFile).QueryInterface(Ci.nsILocalFile);
+    //desktopINI.append("applications");
+    let desktopINI = this.installDir.clone();
+    desktopINI.append(this.appNameAsFilename + ".desktop");
+
+    let webapprtExecutable = this.installDir.clone();
+    webapprtExecutable.append("webapprt-stub");
+
+    writer = factory.createINIParser(desktopINI).QueryInterface(Ci.nsIINIParserWriter);
+    writer.setString("Desktop Entry", "Name", this.appName);
+    writer.setString("Desktop Entry", "Exec", webapprtExecutable.path);
+    writer.setString("Desktop Entry", "Icon", this.iconFile.path);
+    writer.setString("Desktop Entry", "Terminal", "false");
+    writer.setString("Desktop Entry", "Type", "Application");
+    writer.writeFile();
+
+    // This code is to refresh menus under KDE
+    try {
+      // Are we sure kbuildsycoca is always in /usr/bin?
+      let kbuildsycoca = new FileUtils.File("/usr/bin/kbuildsycoca");
+      if (kbuildsycoca.exists()) {
+        let process = Components.classes["@mozilla.org/process/util;1"]
+                                .createInstance(Components.interfaces.nsIProcess);
+        process.init(kbuildsycoca);
+        process.runAsync([], 0);
+      }
+    }
+    catch (e) {
+      throw("Error executing kbuildsycoca: " + e);
+    }
+  },
+
+  /**
+   * This variable specifies if the icon retrieval process should
+   * use a temporary file in the system or a binary stream. This
+   * is accessed by a common function in WebappsIconHelpers.js and
+   * is different for each platform.
+   */
+  useTmpForIcon: false,
+
+  /**
+   * Process the icon from the imageStream as retrieved from
+   * the URL by getIconForApp().
+   *
+   * @param aMimeType     ahe icon mimetype
+   * @param aImageStream  the stream for the image data
+   * @param aCallback     a callback function to be called
+   *                      after the process finishes
+   */
+  processIcon: function(aMimeType, aImageStream, aCallback) {
+    let iconStream;
+    try {
+      let imgTools = Cc["@mozilla.org/image/tools;1"]
+                       .createInstance(Ci.imgITools);
+      let imgContainer = { value: null };
+
+      imgTools.decodeImageData(aImageStream, aMimeType, imgContainer);
+      // Check if we can put icons with different resolutions in the .desktop file
+      iconStream = imgTools.encodeScaledImage(imgContainer.value,
+                                              "image/png", 48, 48);
+    } catch (e) {
+      throw("processIcon - Failure converting icon (" + e + ")");
+    }
+
+    this.iconFile.create(Ci.nsIFile.NORMAL_FILE_TYPE, 0777);
+    let outputStream = FileUtils.openSafeFileOutputStream(this.iconFile);
+    NetUtil.asyncCopy(iconStream, outputStream);
+  }
 }
 
 #endif
